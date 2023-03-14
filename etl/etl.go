@@ -26,6 +26,7 @@ import (
 	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/log/v3"
+	"golang.org/x/sync/errgroup"
 )
 
 type CurrentTableReader interface {
@@ -71,6 +72,10 @@ type TransformArgs struct {
 	ExtractEndKey   []byte
 	BufferType      int
 	BufferSize      int
+
+	UseAsyncExecution      bool
+	AsyncExtractChan       chan ExtractFuncArgs
+	AsyncExtractResultChan <-chan ExtractResult
 }
 
 func Transform(
@@ -92,7 +97,15 @@ func Transform(
 	defer collector.Close()
 
 	t := time.Now()
-	if err := extractBucketIntoFiles(logPrefix, db, fromBucket, args.ExtractStartKey, args.ExtractEndKey, collector, extractFunc, args.Quit, args.LogDetailsExtract); err != nil {
+	var err error
+	if args.UseAsyncExecution {
+		err = extractBucketIntoFilesAsync(logPrefix, db, fromBucket, args.ExtractStartKey, args.ExtractEndKey,
+			collector, args.AsyncExtractChan, args.AsyncExtractResultChan,
+			args.Quit, args.LogDetailsExtract)
+	} else {
+		err = extractBucketIntoFiles(logPrefix, db, fromBucket, args.ExtractStartKey, args.ExtractEndKey, collector, extractFunc, args.Quit, args.LogDetailsExtract)
+	}
+	if err != nil {
 		return err
 	}
 	log.Trace(fmt.Sprintf("[%s] Extraction finished", logPrefix), "took", time.Since(t))
@@ -101,6 +114,98 @@ func Transform(
 		log.Trace(fmt.Sprintf("[%s] Load finished", logPrefix), "took", time.Since(t))
 	}(time.Now())
 	return collector.Load(db, toBucket, loadFunc, args)
+}
+
+const AsyncBufferSize = 4096
+
+type ExtractFuncArgs struct {
+	K []byte
+	V []byte
+}
+
+type ExtractResult struct {
+	Err       error
+	OriginalK []byte
+	K         []byte
+	V         []byte
+}
+
+func extractBucketIntoFilesAsync(
+	logPrefix string,
+	db kv.Tx,
+	bucket string,
+	startkey []byte,
+	endkey []byte,
+	collector *Collector,
+	extractChan chan ExtractFuncArgs,
+	resultChan <-chan ExtractResult,
+	quit <-chan struct{},
+	additionalLogArguments AdditionalLogArguments,
+) error {
+	logEvery := time.NewTicker(30 * time.Second)
+	defer logEvery.Stop()
+
+	var numResults uint64
+	g := errgroup.Group{}
+	g.Go(func() error {
+		for res := range resultChan {
+			numResults++
+			if res.Err != nil {
+				return res.Err
+			}
+			err := collector.extractNextFunc(res.OriginalK, res.K, res.V)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	sendWorks := func() error {
+		defer close(extractChan)
+		c, err := db.Cursor(bucket)
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+
+		for k, v, e := c.Seek(startkey); k != nil; k, v, e = c.Next() {
+			if e != nil {
+				return e
+			}
+			if err := common.Stopped(quit); err != nil {
+				return err
+			}
+			select {
+			default:
+			case <-logEvery.C:
+				logArs := []interface{}{"from", bucket}
+				if additionalLogArguments != nil {
+					logArs = append(logArs, additionalLogArguments(k, v)...)
+				} else {
+					logArs = append(logArs, "current_prefix", makeCurrentKeyStr(k))
+				}
+
+				log.Info(fmt.Sprintf("[%s] ETL [1/2] Extracting", logPrefix), logArs...)
+			}
+			if endkey != nil && bytes.Compare(k, endkey) >= 0 {
+				// endKey is exclusive bound: [startkey, endkey)
+				return nil
+			}
+			extractChan <- ExtractFuncArgs{
+				K: common.Copy(k),
+				V: common.Copy(v),
+			}
+		}
+		return nil
+	}
+	if err := sendWorks(); err != nil {
+		return err
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	return collector.flushBuffer(true)
 }
 
 // extractBucketIntoFiles - [startkey, endkey)
