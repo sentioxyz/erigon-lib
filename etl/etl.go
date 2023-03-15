@@ -205,7 +205,7 @@ func extractBucketIntoFilesAsync(
 	if err := g.Wait(); err != nil {
 		return err
 	}
-	return collector.flushBuffer(true)
+	return collector.FlushBuffer(true)
 }
 
 // extractBucketIntoFiles - [startkey, endkey)
@@ -255,7 +255,7 @@ func extractBucketIntoFiles(
 			return err
 		}
 	}
-	return collector.flushBuffer(true)
+	return collector.FlushBuffer(true)
 }
 
 type currentTableReader struct {
