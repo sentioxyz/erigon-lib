@@ -34,6 +34,7 @@ import (
 	"github.com/ledgerwatch/erigon-lib/etl"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/kv/bitmapdb"
+	"github.com/ledgerwatch/erigon-lib/kv/iter"
 	"github.com/ledgerwatch/erigon-lib/kv/order"
 	"github.com/ledgerwatch/log/v3"
 	"go.uber.org/atomic"
@@ -64,9 +65,9 @@ type AggregatorV3 struct {
 	working                atomic.Bool
 	workingMerge           atomic.Bool
 	workingOptionalIndices atomic.Bool
-	warmupWorking          atomic.Bool
-	ctx                    context.Context
-	ctxCancel              context.CancelFunc
+	//warmupWorking          atomic.Bool
+	ctx       context.Context
+	ctxCancel context.CancelFunc
 
 	needSaveFilesListInDB atomic.Bool
 	wg                    sync.WaitGroup
@@ -81,13 +82,13 @@ func NewAggregatorV3(ctx context.Context, dir, tmpdir string, aggregationStep ui
 	ctx, ctxCancel := context.WithCancel(ctx)
 	a := &AggregatorV3{ctx: ctx, ctxCancel: ctxCancel, onFreeze: func(frozenFileNames []string) {}, dir: dir, tmpdir: tmpdir, aggregationStep: aggregationStep, backgroundResult: &BackgroundResult{}, db: db, keepInDB: 2 * aggregationStep}
 	var err error
-	if a.accounts, err = NewHistory(dir, a.tmpdir, aggregationStep, "accounts", kv.AccountHistoryKeys, kv.AccountIdx, kv.AccountHistoryVals, kv.AccountSettings, false /* compressVals */, nil); err != nil {
+	if a.accounts, err = NewHistory(dir, a.tmpdir, aggregationStep, "accounts", kv.AccountHistoryKeys, kv.AccountIdx, kv.AccountHistoryVals, kv.AccountSettings, false /* compressVals */, nil, false); err != nil {
 		return nil, err
 	}
-	if a.storage, err = NewHistory(dir, a.tmpdir, aggregationStep, "storage", kv.StorageHistoryKeys, kv.StorageIdx, kv.StorageHistoryVals, kv.StorageSettings, false /* compressVals */, nil); err != nil {
+	if a.storage, err = NewHistory(dir, a.tmpdir, aggregationStep, "storage", kv.StorageHistoryKeys, kv.StorageIdx, kv.StorageHistoryVals, kv.StorageSettings, false /* compressVals */, nil, false); err != nil {
 		return nil, err
 	}
-	if a.code, err = NewHistory(dir, a.tmpdir, aggregationStep, "code", kv.CodeHistoryKeys, kv.CodeIdx, kv.CodeHistoryVals, kv.CodeSettings, true /* compressVals */, nil); err != nil {
+	if a.code, err = NewHistory(dir, a.tmpdir, aggregationStep, "code", kv.CodeHistoryKeys, kv.CodeIdx, kv.CodeHistoryVals, kv.CodeSettings, true /* compressVals */, nil, true); err != nil {
 		return nil, err
 	}
 	if a.logAddrs, err = NewInvertedIndex(dir, a.tmpdir, aggregationStep, "logaddrs", kv.LogAddressKeys, kv.LogAddressIdx, false, nil); err != nil {
@@ -226,6 +227,9 @@ func (a *AggregatorV3) BuildOptionalMissedIndicesInBackground(ctx context.Contex
 		defer a.wg.Done()
 		defer a.workingOptionalIndices.Store(false)
 		if err := a.BuildOptionalMissedIndices(ctx, workers); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			log.Warn("merge", "err", err)
 		}
 	}()
@@ -627,47 +631,33 @@ func (a *AggregatorV3) Unwind(ctx context.Context, txUnwindTo uint64, stateLoad 
 	return nil
 }
 
-func (a *AggregatorV3) Warmup(ctx context.Context, txFrom, limit uint64) {
+func (a *AggregatorV3) Warmup(ctx context.Context, txFrom, limit uint64) error {
 	if a.db == nil {
-		return
+		return nil
 	}
-	if limit < 10_000 {
-		return
-	}
-	if ok := a.warmupWorking.CompareAndSwap(false, true); !ok {
-		return
-	}
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		defer a.warmupWorking.Store(false)
-		if err := a.db.View(ctx, func(tx kv.Tx) error {
-			if err := a.accounts.warmup(ctx, txFrom, limit, tx); err != nil {
-				return err
-			}
-			if err := a.storage.warmup(ctx, txFrom, limit, tx); err != nil {
-				return err
-			}
-			if err := a.code.warmup(ctx, txFrom, limit, tx); err != nil {
-				return err
-			}
-			if err := a.logAddrs.warmup(txFrom, limit, tx); err != nil {
-				return err
-			}
-			if err := a.logTopics.warmup(txFrom, limit, tx); err != nil {
-				return err
-			}
-			if err := a.tracesFrom.warmup(txFrom, limit, tx); err != nil {
-				return err
-			}
-			if err := a.tracesTo.warmup(txFrom, limit, tx); err != nil {
-				return err
-			}
-			return nil
-		}); err != nil {
-			log.Warn("[snapshots] prune warmup", "err", err)
-		}
-	}()
+	e, ctx := errgroup.WithContext(ctx)
+	e.Go(func() error {
+		return a.db.View(ctx, func(tx kv.Tx) error { return a.accounts.warmup(ctx, txFrom, limit, tx) })
+	})
+	e.Go(func() error {
+		return a.db.View(ctx, func(tx kv.Tx) error { return a.storage.warmup(ctx, txFrom, limit, tx) })
+	})
+	e.Go(func() error {
+		return a.db.View(ctx, func(tx kv.Tx) error { return a.code.warmup(ctx, txFrom, limit, tx) })
+	})
+	e.Go(func() error {
+		return a.db.View(ctx, func(tx kv.Tx) error { return a.logAddrs.warmup(ctx, txFrom, limit, tx) })
+	})
+	e.Go(func() error {
+		return a.db.View(ctx, func(tx kv.Tx) error { return a.logTopics.warmup(ctx, txFrom, limit, tx) })
+	})
+	e.Go(func() error {
+		return a.db.View(ctx, func(tx kv.Tx) error { return a.tracesFrom.warmup(ctx, txFrom, limit, tx) })
+	})
+	e.Go(func() error {
+		return a.db.View(ctx, func(tx kv.Tx) error { return a.tracesTo.warmup(ctx, txFrom, limit, tx) })
+	})
+	return e.Wait()
 }
 
 // StartWrites - pattern: `defer agg.StartWrites().FinishWrites()`
@@ -767,11 +757,16 @@ func (a *AggregatorV3) PruneWithTiemout(ctx context.Context, timeout time.Durati
 }
 
 func (a *AggregatorV3) Prune(ctx context.Context, limit uint64) error {
-	//ctx, cancel := context.WithCancel(ctx)
-	//defer cancel()
-	//go func() {
-	//	a.Warmup(ctx, 0, cmp.Max(a.aggregationStep, limit)) // warmup is asyn and moving faster than data deletion
-	//}()
+	//if limit/a.aggregationStep > StepsInBiggestFile {
+	//	ctx, cancel := context.WithCancel(ctx)
+	//	defer cancel()
+	//
+	//	a.wg.Add(1)
+	//	go func() {
+	//		defer a.wg.Done()
+	//		_ = a.Warmup(ctx, 0, cmp.Max(a.aggregationStep, limit)) // warmup is asyn and moving faster than data deletion
+	//	}()
+	//}
 	return a.prune(ctx, 0, a.maxTxNum.Load(), limit)
 }
 
@@ -1051,6 +1046,7 @@ func (a *AggregatorV3) mergeFiles(ctx context.Context, files SelectedStaticFiles
 		}
 	}()
 	if r.accounts.any() {
+		log.Info(fmt.Sprintf("[snapshots] merge: %d-%d", r.accounts.historyStartTxNum/a.aggregationStep, r.accounts.historyEndTxNum/a.aggregationStep))
 		g.Go(func() error {
 			var err error
 			mf.accountsIdx, mf.accountsHist, err = a.accounts.mergeFiles(ctx, files.accountsIdx, files.accountsHist, r.accounts, workers)
@@ -1183,6 +1179,9 @@ func (a *AggregatorV3) BuildFilesInBackground() {
 			defer a.wg.Done()
 			defer a.workingMerge.Store(false)
 			if err := a.MergeLoop(a.ctx, 1); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return
+				}
 				log.Warn("merge", "err", err)
 			}
 
@@ -1270,29 +1269,29 @@ func (a *AggregatorV3) EnableMadvNormal() *AggregatorV3 {
 }
 
 // -- range
-func (ac *AggregatorV3Context) LogAddrIterator(addr []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (*InvertedIterator, error) {
+func (ac *AggregatorV3Context) LogAddrIterator(addr []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (iter.U64, error) {
 	return ac.logAddrs.IterateRange(addr, startTxNum, endTxNum, asc, limit, tx)
 }
 
-func (ac *AggregatorV3Context) LogTopicIterator(topic []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (*InvertedIterator, error) {
+func (ac *AggregatorV3Context) LogTopicIterator(topic []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (iter.U64, error) {
 	return ac.logTopics.IterateRange(topic, startTxNum, endTxNum, asc, limit, tx)
 }
 
-func (ac *AggregatorV3Context) TraceFromIterator(addr []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (*InvertedIterator, error) {
+func (ac *AggregatorV3Context) TraceFromIterator(addr []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (iter.U64, error) {
 	return ac.tracesFrom.IterateRange(addr, startTxNum, endTxNum, asc, limit, tx)
 }
 
-func (ac *AggregatorV3Context) TraceToIterator(addr []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (*InvertedIterator, error) {
+func (ac *AggregatorV3Context) TraceToIterator(addr []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (iter.U64, error) {
 	return ac.tracesTo.IterateRange(addr, startTxNum, endTxNum, asc, limit, tx)
 }
-func (ac *AggregatorV3Context) AccountHistoyIdxIterator(addr []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (*InvertedIterator, error) {
-	return ac.accounts.ic.IterateRange(addr, startTxNum, endTxNum, asc, limit, tx)
+func (ac *AggregatorV3Context) AccountHistoyIdxIterator(addr []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (iter.U64, error) {
+	return ac.accounts.IdxRange(addr, startTxNum, endTxNum, asc, limit, tx)
 }
-func (ac *AggregatorV3Context) StorageHistoyIdxIterator(addr []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (*InvertedIterator, error) {
-	return ac.storage.ic.IterateRange(addr, startTxNum, endTxNum, asc, limit, tx)
+func (ac *AggregatorV3Context) StorageHistoyIdxIterator(addr []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (iter.U64, error) {
+	return ac.storage.IdxRange(addr, startTxNum, endTxNum, asc, limit, tx)
 }
-func (ac *AggregatorV3Context) CodeHistoyIdxIterator(addr []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (*InvertedIterator, error) {
-	return ac.code.ic.IterateRange(addr, startTxNum, endTxNum, asc, limit, tx)
+func (ac *AggregatorV3Context) CodeHistoyIdxIterator(addr []byte, startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (iter.U64, error) {
+	return ac.code.IdxRange(addr, startTxNum, endTxNum, asc, limit, tx)
 }
 
 // -- range end
@@ -1352,27 +1351,27 @@ func (ac *AggregatorV3Context) ReadAccountCodeSizeNoState(addr []byte, txNum uin
 	return len(code), noState, nil
 }
 
-func (ac *AggregatorV3Context) AccountHistoryIterateChanged(startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) *HistoryChangesIter {
+func (ac *AggregatorV3Context) AccountHistoryIterateChanged(startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (iter.KV, error) {
 	return ac.accounts.IterateChanged(startTxNum, endTxNum, asc, limit, tx)
 }
 
-func (ac *AggregatorV3Context) StorageHistoryIterateChanged(startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) *HistoryChangesIter {
+func (ac *AggregatorV3Context) StorageHistoryIterateChanged(startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (iter.KV, error) {
 	return ac.storage.IterateChanged(startTxNum, endTxNum, asc, limit, tx)
 }
 
-func (ac *AggregatorV3Context) CodeHistoryIterateChanged(startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) *HistoryChangesIter {
+func (ac *AggregatorV3Context) CodeHistoryIterateChanged(startTxNum, endTxNum int, asc order.By, limit int, tx kv.Tx) (iter.KV, error) {
 	return ac.code.IterateChanged(startTxNum, endTxNum, asc, limit, tx)
 }
 
-func (ac *AggregatorV3Context) AccountHistoricalStateRange(startTxNum uint64, from, to []byte, limit int, tx kv.Tx) *StateAsOfIter {
+func (ac *AggregatorV3Context) AccountHistoricalStateRange(startTxNum uint64, from, to []byte, limit int, tx kv.Tx) iter.KV {
 	return ac.accounts.WalkAsOf(startTxNum, from, to, tx, limit)
 }
 
-func (ac *AggregatorV3Context) StorageHistoricalStateRange(startTxNum uint64, from, to []byte, limit int, tx kv.Tx) *StateAsOfIter {
+func (ac *AggregatorV3Context) StorageHistoricalStateRange(startTxNum uint64, from, to []byte, limit int, tx kv.Tx) iter.KV {
 	return ac.storage.WalkAsOf(startTxNum, from, to, tx, limit)
 }
 
-func (ac *AggregatorV3Context) CodeHistoricalStateRange(startTxNum uint64, from, to []byte, limit int, tx kv.Tx) *StateAsOfIter {
+func (ac *AggregatorV3Context) CodeHistoricalStateRange(startTxNum uint64, from, to []byte, limit int, tx kv.Tx) iter.KV {
 	return ac.code.WalkAsOf(startTxNum, from, to, tx, limit)
 }
 

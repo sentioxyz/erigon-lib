@@ -205,13 +205,16 @@ func (c *Collector) Load(db kv.RwTx, toBucket string, loadFunc LoadFunc, args Tr
 				logArs = append(logArs, "current_prefix", makeCurrentKeyStr(k))
 			}
 
-			log.Info(fmt.Sprintf("[%s] ETL [2/2] Loading", c.logPrefix), logArs...)
+			log.Log(c.logLvl, fmt.Sprintf("[%s] ETL [2/2] Loading", c.logPrefix), logArs...)
 		}
 
-		if canUseAppend && len(v) == 0 {
-			return nil // nothing to delete after end of bucket
-		}
-		if len(v) == 0 {
+		isNil := (c.bufType == SortableSliceBuffer && v == nil) ||
+			(c.bufType == SortableAppendBuffer && len(v) == 0) || //backward compatibility
+			(c.bufType == SortableOldestAppearedBuffer && len(v) == 0)
+		if isNil {
+			if canUseAppend {
+				return nil // nothing to delete after end of bucket
+			}
 			if err := cursor.Delete(k); err != nil {
 				return err
 			}
