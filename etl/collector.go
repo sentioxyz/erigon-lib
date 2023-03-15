@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/ledgerwatch/log/v3"
@@ -38,7 +39,8 @@ type LoadFunc func(k, v []byte, table CurrentTableReader, next LoadNextFunc) err
 type simpleLoadFunc func(k, v []byte) error
 
 // Collector performs the job of ETL Transform, but can also be used without "E" (Extract) part
-// as a Collect Transform Load
+// as a Collect Transform Load.
+// It is safe to use Collector.Collect from multiple goroutines.
 type Collector struct {
 	buf           Buffer
 	logPrefix     string
@@ -48,6 +50,8 @@ type Collector struct {
 	bufType       int
 	allFlushed    bool
 	autoClean     bool
+
+	mutex sync.Mutex
 }
 
 // NewCollectorFromFiles creates collector from existing files (left over from previous unsuccessful loading)
@@ -90,11 +94,13 @@ func NewCollector(logPrefix, tmpdir string, sortableBuffer Buffer) *Collector {
 }
 
 func (c *Collector) extractNextFunc(originalK, k []byte, v []byte) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	c.buf.Put(k, v)
 	if !c.buf.CheckFlushSize() {
 		return nil
 	}
-	return c.flushBuffer(false)
+	return c.flushBufferInternal(false)
 }
 
 func (c *Collector) Collect(k, v []byte) error {
@@ -103,7 +109,14 @@ func (c *Collector) Collect(k, v []byte) error {
 
 func (c *Collector) LogLvl(v log.Lvl) { c.logLvl = v }
 
-func (c *Collector) flushBuffer(canStoreInRam bool) error {
+func (c *Collector) FlushBuffer(canStoreInRam bool) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.flushBufferInternal(canStoreInRam)
+}
+
+// Must be called under mutex.
+func (c *Collector) flushBufferInternal(canStoreInRam bool) error {
 	if c.buf.Len() == 0 {
 		return nil
 	}
@@ -132,7 +145,7 @@ func (c *Collector) Load(db kv.RwTx, toBucket string, loadFunc LoadFunc, args Tr
 	}
 
 	if !c.allFlushed {
-		if e := c.flushBuffer(true); e != nil {
+		if e := c.FlushBuffer(true); e != nil {
 			return e
 		}
 	}
@@ -235,6 +248,8 @@ func (c *Collector) Load(db kv.RwTx, toBucket string, loadFunc LoadFunc, args Tr
 }
 
 func (c *Collector) reset() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	for _, p := range c.dataProviders {
 		p.Dispose()
 	}
