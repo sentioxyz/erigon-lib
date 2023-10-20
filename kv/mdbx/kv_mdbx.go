@@ -334,7 +334,7 @@ func (opts MdbxOpts) Open() (kv.RwDB, error) {
 	//}
 
 	if opts.roTxsLimiter == nil {
-		targetSemCount := int64(runtime.GOMAXPROCS(-1) * 8)
+		targetSemCount := int64(runtime.GOMAXPROCS(-1)*8) - 1
 		opts.roTxsLimiter = semaphore.NewWeighted(targetSemCount) // 1 less than max to allow unlocking to happen
 	}
 	db := &MdbxKV{
