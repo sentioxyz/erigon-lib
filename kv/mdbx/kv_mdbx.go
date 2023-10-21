@@ -487,9 +487,9 @@ func (db *MdbxKV) BeginRo(ctx context.Context) (txn kv.Tx, err error) {
 	}
 
 	// will return nil err if context is cancelled (may appear to acquire the semaphore)
-	if semErr := db.roTxsLimiter.Acquire(ctx, 1); semErr != nil {
-		return nil, semErr
-	}
+	//if semErr := db.roTxsLimiter.Acquire(ctx, 1); semErr != nil {
+	//	return nil, semErr
+	//}
 
 	defer func() {
 		if err == nil {
@@ -498,7 +498,7 @@ func (db *MdbxKV) BeginRo(ctx context.Context) (txn kv.Tx, err error) {
 		if txn == nil {
 			// on error, or if there is whatever reason that we don't return a tx,
 			// we need to free up the limiter slot, otherwise it could lead to deadlocks
-			db.roTxsLimiter.Release(1)
+			//db.roTxsLimiter.Release(1)
 		}
 	}()
 
@@ -785,7 +785,7 @@ func (tx *MdbxTx) Commit() error {
 		tx.tx = nil
 		tx.db.wg.Done()
 		if tx.readOnly {
-			tx.db.roTxsLimiter.Release(1)
+			//tx.db.roTxsLimiter.Release(1)
 		} else {
 			runtime.UnlockOSThread()
 		}
@@ -835,7 +835,7 @@ func (tx *MdbxTx) Rollback() {
 		tx.tx = nil
 		tx.db.wg.Done()
 		if tx.readOnly {
-			tx.db.roTxsLimiter.Release(1)
+			//tx.db.roTxsLimiter.Release(1)
 		} else {
 			runtime.UnlockOSThread()
 		}
